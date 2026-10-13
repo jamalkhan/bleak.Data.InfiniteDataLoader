@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <PackageId>bleak.Data.InfiniteDataLoader</PackageId>
+    <Authors>Jamal Khan</Authors>
+    <Company>bleak LLC</Company>
+    <Copyright>bleak LLC</Copyright>
+    <Description>Streaming CSV reader, writer and splitter, external sort, and merge join that work on files larger than RAM.</Description>
+    <PackageTags>csv;streaming;external-sort;merge-join;large-files</PackageTags>
+    <PackageLicenseExpression>Unlicense</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/jamalkhan/bleak.Data.InfiniteDataLoader</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/jamalkhan/bleak.Data.InfiniteDataLoader.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

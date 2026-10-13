@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/bleak.Data.InfiniteDataLoader/bleak.Data.InfiniteDataLoader.csproj" />
+  <Project Path="tests/bleak.Data.InfiniteDataLoader.Tests/bleak.Data.InfiniteDataLoader.Tests.csproj" />
+</Solution>
