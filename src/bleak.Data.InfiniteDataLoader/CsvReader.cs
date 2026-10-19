@@ -1,4 +1,7 @@
+using System.Diagnostics;
 using System.Text;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace bleak.Data.InfiniteDataLoader;
 
@@ -13,27 +16,45 @@ namespace bleak.Data.InfiniteDataLoader;
 /// qualifier ("") as an escaped qualifier.
 ///
 /// The underlying reader is forward-only, so <see cref="ReadRecords"/> may be enumerated once.
+///
+/// Logging (category <c>bleak.Data.InfiniteDataLoader.CsvReader</c>): Debug only, one line on open and
+/// one on dispose with totals. Nothing is logged per row. Rows are only counted while Debug is enabled.
 /// </summary>
-public sealed class CsvReader : IDisposable
+public sealed partial class CsvReader : IDisposable
 {
     private readonly TextReader _reader;
     private readonly bool _ownsReader;
     private readonly char _delimiter;
     private readonly char _quote;
     private readonly Dictionary<string, int> _headerIndex;
+    private readonly ILogger _logger;
+    private readonly string? _path;
+    private readonly FileStream? _fileStream;
+    private readonly long _openedAt;
+    private long _rowCount;
+    private bool _disposed;
 
     /// <summary>The header row, in file order. Empty when the source has no rows.</summary>
     public IReadOnlyList<string> Headers { get; }
 
     /// <summary>Opens a CSV file. Encoding is auto-detected from the byte-order mark (defaults to UTF-8).</summary>
-    public CsvReader(string path, char delimiter = ',', char quote = '"')
-        : this(OpenFile(path), delimiter, quote, ownsReader: true)
+    public CsvReader(string path, char delimiter = ',', char quote = '"', ILogger<CsvReader>? logger = null)
+        : this(OpenFile(path), delimiter, quote, ownsReader: true, logger, path)
     {
     }
 
     /// <summary>Reads from an arbitrary <see cref="TextReader"/>. Primarily for testing.</summary>
-    public CsvReader(TextReader reader, char delimiter = ',', char quote = '"', bool ownsReader = false)
+    public CsvReader(TextReader reader, char delimiter = ',', char quote = '"', bool ownsReader = false, ILogger<CsvReader>? logger = null)
+        : this(reader, delimiter, quote, ownsReader, logger, path: null)
     {
+    }
+
+    private CsvReader(TextReader reader, char delimiter, char quote, bool ownsReader, ILogger? logger, string? path)
+    {
+        _openedAt = Stopwatch.GetTimestamp();
+        _logger = logger ?? NullLogger<CsvReader>.Instance;
+        _path = path;
+        _fileStream = (reader as StreamReader)?.BaseStream as FileStream;
         _reader = reader;
         _ownsReader = ownsReader;
         _delimiter = delimiter;
@@ -55,6 +76,15 @@ public sealed class CsvReader : IDisposable
         {
             _headerIndex[Headers[i]] = i;
         }
+
+        if (_path is not null)
+        {
+            Log.FileOpened(_logger, _path, Headers.Count);
+        }
+        else
+        {
+            Log.ReaderOpened(_logger, Headers.Count);
+        }
     }
 
     private static StreamReader OpenFile(string path)
@@ -71,7 +101,21 @@ public sealed class CsvReader : IDisposable
     /// Lazily yields each data record (header excluded) as a string array, reading the source in a
     /// single forward pass. Each yielded array is freshly allocated, so callers may retain it.
     /// </summary>
-    public IEnumerable<string[]> ReadRecords() => ParseAll(_reader, _delimiter, _quote);
+    public IEnumerable<string[]> ReadRecords()
+    {
+        var records = ParseAll(_reader, _delimiter, _quote);
+        // Count rows only when the Dispose summary will actually be written: zero overhead otherwise.
+        return _logger.IsEnabled(LogLevel.Debug) ? CountRows(records) : records;
+    }
+
+    private IEnumerable<string[]> CountRows(IEnumerable<string[]> records)
+    {
+        foreach (var record in records)
+        {
+            _rowCount++;
+            yield return record;
+        }
+    }
 
     /// <summary>
     /// The core state-machine parser. Reads characters one at a time from the (internally buffered)
@@ -158,9 +202,58 @@ public sealed class CsvReader : IDisposable
 
     public void Dispose()
     {
+        if (_disposed)
+        {
+            return;
+        }
+        _disposed = true;
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            var durationMs = Stopwatch.GetElapsedTime(_openedAt).TotalMilliseconds;
+            if (_path is not null)
+            {
+                // Position of the underlying file = bytes pulled from disk so far (includes read-ahead buffer).
+                long bytes = -1;
+                try
+                {
+                    bytes = _fileStream?.Position ?? -1;
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Stream already closed by someone else; size unknown.
+                }
+                Log.FileClosed(_logger, _path, _rowCount, bytes, durationMs);
+            }
+            else
+            {
+                Log.ReaderClosed(_logger, _rowCount, durationMs);
+            }
+        }
+
         if (_ownsReader)
         {
             _reader.Dispose();
         }
+    }
+
+    // EventIds 1000-1099.
+    private static partial class Log
+    {
+        [LoggerMessage(EventId = 1000, Level = LogLevel.Debug,
+            Message = "CSV reader opened {FilePath}: {ColumnCount} columns")]
+        public static partial void FileOpened(ILogger logger, string filePath, int columnCount);
+
+        [LoggerMessage(EventId = 1001, Level = LogLevel.Debug,
+            Message = "CSV reader closed {FilePath}: {RowCount} rows, {ByteCount} bytes read, {DurationMs} ms")]
+        public static partial void FileClosed(ILogger logger, string filePath, long rowCount, long byteCount, double durationMs);
+
+        [LoggerMessage(EventId = 1002, Level = LogLevel.Debug,
+            Message = "CSV reader opened on a TextReader: {ColumnCount} columns")]
+        public static partial void ReaderOpened(ILogger logger, int columnCount);
+
+        [LoggerMessage(EventId = 1003, Level = LogLevel.Debug,
+            Message = "CSV reader closed (TextReader): {RowCount} rows, {DurationMs} ms")]
+        public static partial void ReaderClosed(ILogger logger, long rowCount, double durationMs);
     }
 }
