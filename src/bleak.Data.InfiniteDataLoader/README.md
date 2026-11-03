@@ -92,6 +92,8 @@ names and paths, and column counts. Field values, keys and record contents are n
 dotnet add package bleak.Data.InfiniteDataLoader
 ```
 
+Requires .NET 10. The only dependency is `Microsoft.Extensions.Logging.Abstractions` (10.0.x).
+
 ## License
 
-[The Unlicense](LICENSE) (public domain).
+[The Unlicense](https://github.com/jamalkhan/bleak.Data.InfiniteDataLoader/blob/master/LICENSE) (public domain).
