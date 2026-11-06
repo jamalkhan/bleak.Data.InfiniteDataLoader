@@ -7,10 +7,10 @@ working with files that do not fit in RAM:
 
 | Type | Purpose |
 |---|---|
-| `CsvReader` | Forward-only, quoted-field-aware reader. |
+| `CsvReader` | Forward-only, quoted-field-aware reader. Reads 64 KB blocks and finds field boundaries with a vectorized search. |
 | `CsvWriter` | Writer with correct quoting/escaping. |
 | `CsvSplitter` | Splits a huge file into parts by row count. |
-| `ExternalSorter` | Disk-backed external merge sort on a key column. |
+| `ExternalSorter` | Disk-backed, stable external merge sort on a key. Tune it with `ExternalSortOptions`. |
 | `MergeJoin` | Streaming merge join of two key-sorted inputs. |
 
 ```csharp
@@ -55,6 +55,8 @@ using var reader = new CsvReader("customers.csv", logger: loggerFactory.CreateLo
 | `CsvReader` | `ILogger<CsvReader>? logger` | - | opened (column count); closed (rows, bytes read, `DurationMs`) | - |
 
 Warnings: `CsvSplitter` input with no data rows; `ExternalSorter` temp directory that could not be deleted.
+`ExternalSorter.CleanupStaleWorkDirectories` logs one Information line when it deletes leftovers. An input that fits in
+one chunk logs a Debug "sorted in memory" line (event 1309) instead of spilling.
 Errors: a sort or split that throws is logged with the exception (and rethrown).
 
 Event IDs: 1000-1099 `CsvReader`, 1200-1299 `CsvSplitter`, 1300-1399 `ExternalSorter`, 1400-1499 `MergeJoin`.
@@ -71,6 +73,34 @@ Notes for performance work:
 
 **Data guarantee:** at Debug and above, the library logs only metadata: counts, byte sizes, durations, file
 names and paths, and column counts. Field values, keys and record contents are never logged at any level.
+
+## External sort options (2.1)
+
+```csharp
+var sorted = ExternalSorter.SortByStringKey(rows, r => r[0], new ExternalSortOptions
+{
+    ChunkSize = 200_000,               // records per chunk (default)
+    MaxChunkBytes = 256L << 20,        // optional: spill sooner when records are wide
+    TempDirectory = "/Volumes/scratch", // default: the system temp folder
+    BackgroundSpill = true,             // default: sort/write a chunk while the next one is read
+    MergeReadBufferSize = 64 * 1024,    // default: read buffer per run file during the merge
+});
+```
+
+What changed in 2.1, without breaking the 2.0 API:
+
+- The sort is **stable**: records with equal keys come out in input order (2.0 left their order unspecified).
+- Each record's key is computed once (2.0 computed it twice per comparison).
+- Run files are binary (length-prefixed UTF-8), so the merge no longer re-parses CSV. The `delimiter` and
+  `quote` parameters of the 2.0 overloads are accepted and ignored.
+- With `BackgroundSpill`, a full chunk is sorted and written on a pool thread while the next chunk is read, so up
+  to two chunks are in memory.
+- An input that fits in one chunk is sorted in memory and never touches the disk.
+- Each work directory records its process id. `ExternalSorter.CleanupStaleWorkDirectories(tempDirectory)` deletes
+  `extsort_*` directories whose process is gone (or, for pre-2.1 directories, that are older than 24 hours).
+- `CsvReader` parses 64 KB blocks with a vectorized search instead of one character at a time; the grammar is
+  unchanged (a test compares it against the 2.0 parser on random input). Its file buffers dropped from 1 MB + 2 MB
+  to 256 KB + 128 KB, which matters when dozens of readers are open at once.
 
 ## Upgrading from 1.x
 

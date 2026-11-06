@@ -14,7 +14,10 @@ namespace bleak.Data.InfiniteDataLoader;
 /// (phase 2) — independent of total input size.
 ///
 /// The result is a lazily-evaluated stream; temp files are created on first enumeration and deleted
-/// when enumeration completes or the enumerator is disposed.
+/// when enumeration completes or the enumerator is disposed. Since 2.1 the sort is stable (equal keys keep
+/// their input order), each record's key is computed once, run files are binary (no CSV re-parsing), the
+/// next chunk is read while the previous one is sorted and written on a pool thread, and an input that fits
+/// in one chunk never touches the disk. See <see cref="ExternalSortOptions"/>.
 ///
 /// Logging: pass any <see cref="ILogger"/> (recommended: <c>loggerFactory.CreateLogger(typeof(ExternalSorter))</c>).
 /// Information at start/completion, Debug per phase, Trace per spilled chunk. Never per row, never record values.
@@ -28,6 +31,8 @@ public static partial class ExternalSorter
     private const string MergePhase = "merge";
 
     /// <summary>Sorts <paramref name="records"/> ascending by a 64-bit integer key.</summary>
+    /// <param name="delimiter">Unused since 2.1: spill files are binary. Kept for source compatibility.</param>
+    /// <param name="quote">Unused since 2.1: spill files are binary. Kept for source compatibility.</param>
     public static IEnumerable<string[]> SortByLongKey(
         IEnumerable<string[]> records,
         Func<string[], long> keySelector,
@@ -36,10 +41,12 @@ public static partial class ExternalSorter
         char delimiter = ',',
         char quote = '"',
         ILogger? logger = null)
-        => SortByKey(records, keySelector, Comparer<long>.Default, chunkSize, tempDirectory, delimiter, quote, logger);
+        => SortByKey(records, keySelector, Comparer<long>.Default, new ExternalSortOptions { ChunkSize = chunkSize, TempDirectory = tempDirectory }, logger);
 
     /// <summary>Sorts <paramref name="records"/> ascending by a string key (ordinal by default). Supports
     /// composite keys (build a single delimited string) and non-numeric keys.</summary>
+    /// <param name="delimiter">Unused since 2.1: spill files are binary. Kept for source compatibility.</param>
+    /// <param name="quote">Unused since 2.1: spill files are binary. Kept for source compatibility.</param>
     public static IEnumerable<string[]> SortByStringKey(
         IEnumerable<string[]> records,
         Func<string[], string> keySelector,
@@ -49,12 +56,23 @@ public static partial class ExternalSorter
         char quote = '"',
         IComparer<string>? comparer = null,
         ILogger? logger = null)
-        => SortByKey(records, keySelector, comparer ?? StringComparer.Ordinal, chunkSize, tempDirectory, delimiter, quote, logger);
+        => SortByKey(records, keySelector, comparer ?? StringComparer.Ordinal, new ExternalSortOptions { ChunkSize = chunkSize, TempDirectory = tempDirectory }, logger);
+
+    /// <summary>Sorts <paramref name="records"/> ascending by a string key with explicit <paramref name="options"/>.</summary>
+    public static IEnumerable<string[]> SortByStringKey(
+        IEnumerable<string[]> records,
+        Func<string[], string> keySelector,
+        ExternalSortOptions options,
+        IComparer<string>? comparer = null,
+        ILogger? logger = null)
+        => SortByKey(records, keySelector, comparer ?? StringComparer.Ordinal, options, logger);
 
     /// <summary>
     /// Sorts <paramref name="records"/> ascending by an arbitrary key with the given comparer. The merge
     /// join only requires the same comparer to be used on every side, so any total order works.
     /// </summary>
+    /// <param name="delimiter">Unused since 2.1: spill files are binary. Kept for source compatibility.</param>
+    /// <param name="quote">Unused since 2.1: spill files are binary. Kept for source compatibility.</param>
     public static IEnumerable<string[]> SortByKey<TKey>(
         IEnumerable<string[]> records,
         Func<string[], TKey> keySelector,
@@ -64,35 +82,52 @@ public static partial class ExternalSorter
         char delimiter = ',',
         char quote = '"',
         ILogger? logger = null)
+        => SortByKey(records, keySelector, comparer, new ExternalSortOptions { ChunkSize = chunkSize, TempDirectory = tempDirectory }, logger);
+
+    /// <summary>
+    /// Sorts <paramref name="records"/> ascending by an arbitrary key. The sort is stable: records with equal
+    /// keys come out in input order. When the whole input fits in one chunk it is sorted in memory and
+    /// nothing is written to disk.
+    /// </summary>
+    public static IEnumerable<string[]> SortByKey<TKey>(
+        IEnumerable<string[]> records,
+        Func<string[], TKey> keySelector,
+        IComparer<TKey> comparer,
+        ExternalSortOptions options,
+        ILogger? logger = null)
     {
-        if (chunkSize <= 0)
+        ArgumentNullException.ThrowIfNull(options);
+        if (options.ChunkSize <= 0)
         {
-            throw new ArgumentOutOfRangeException(nameof(chunkSize), "chunkSize must be greater than zero.");
+            throw new ArgumentOutOfRangeException(nameof(options), "ChunkSize must be greater than zero.");
         }
 
-        return SortIterator(records, keySelector, comparer, chunkSize, tempDirectory, delimiter, quote, logger ?? NullLogger.Instance);
+        return SortIterator(records, keySelector, comparer, options, logger ?? NullLogger.Instance);
     }
 
     private static IEnumerable<string[]> SortIterator<TKey>(
         IEnumerable<string[]> records,
         Func<string[], TKey> keySelector,
         IComparer<TKey> comparer,
-        int chunkSize,
-        string? tempDirectory,
-        char delimiter,
-        char quote,
+        ExternalSortOptions options,
         ILogger logger)
     {
         var sortStart = Stopwatch.GetTimestamp();
-        var workDir = Path.Combine(tempDirectory ?? Path.GetTempPath(), "extsort_" + Guid.NewGuid().ToString("N"));
+        var workDir = Path.Combine(options.TempDirectory ?? Path.GetTempPath(), WorkDirectoryPrefix + Guid.NewGuid().ToString("N"));
+        var chunkSize = options.ChunkSize;
+        var maxChunkBytes = options.MaxChunkBytes is > 0 ? options.MaxChunkBytes.Value : long.MaxValue;
         Log.SortStarted(logger, chunkSize);
 
         long total = 0;
         long merged = 0;
         long bytesSpilled = 0;
-        var runFiles = new List<string>();
+        var runs = new List<SpilledRun>();
         var completed = false;
         var failed = false;
+        Task<SpilledRun>? pending = null;
+        List<string[]>? inMemoryRows = null;
+        List<TKey>? inMemoryKeys = null;
+        int[]? inMemoryOrder = null;
 
         try
         {
@@ -100,38 +135,96 @@ public static partial class ExternalSorter
             // Phase 1 has no yield, so failures can be caught and logged here.
             try
             {
-                Directory.CreateDirectory(workDir);
-                Log.WorkDirectoryCreated(logger, workDir);
-
                 var phaseStart = Stopwatch.GetTimestamp();
                 double sortMs = 0, writeMs = 0;
-                var buffer = new List<string[]>(Math.Min(chunkSize, 1 << 16));
+                var rows = new List<string[]>(Math.Min(chunkSize, 1 << 16));
+                var keys = new List<TKey>(Math.Min(chunkSize, 1 << 16));
+                long chunkBytes = 0;
+                var trackBytes = maxChunkBytes != long.MaxValue;
 
-                void Spill()
+                void Collect(SpilledRun run)
                 {
-                    var run = WriteSortedRun(buffer, keySelector, comparer, workDir, runFiles.Count, delimiter, quote, logger);
-                    runFiles.Add(run.Path);
+                    runs.Add(run);
                     bytesSpilled += run.Bytes;
                     sortMs += run.SortMs;
                     writeMs += run.WriteMs;
-                    buffer.Clear();
+                }
+
+                void WaitPending()
+                {
+                    if (pending is not null)
+                    {
+                        var done = pending;
+                        pending = null;
+                        Collect(done.GetAwaiter().GetResult());
+                    }
+                }
+
+                void Spill(bool last)
+                {
+                    if (runs.Count == 0 && pending is null)
+                    {
+                        Directory.CreateDirectory(workDir);
+                        WriteOwnerFile(workDir);
+                        Log.WorkDirectoryCreated(logger, workDir);
+                    }
+                    var index = runs.Count + (pending is null ? 0 : 1);
+                    if (options.BackgroundSpill && !last)
+                    {
+                        // Sort and write this chunk on a pool thread while the caller's input keeps being read
+                        // into a fresh chunk. At most one chunk is in flight, so memory peaks at two chunks.
+                        WaitPending();
+                        var r = rows;
+                        var k = keys;
+                        pending = Task.Run(() => WriteSortedRun(r, k, comparer, workDir, index, logger));
+                        rows = new List<string[]>(Math.Min(chunkSize, 1 << 16));
+                        keys = new List<TKey>(Math.Min(chunkSize, 1 << 16));
+                    }
+                    else
+                    {
+                        WaitPending();
+                        Collect(WriteSortedRun(rows, keys, comparer, workDir, index, logger));
+                        rows.Clear();
+                        keys.Clear();
+                    }
+                    chunkBytes = 0;
                 }
 
                 foreach (var rec in records)
                 {
-                    buffer.Add(rec);
+                    rows.Add(rec);
+                    keys.Add(keySelector(rec));
                     total++;
-                    if (buffer.Count >= chunkSize)
+                    if (trackBytes)
                     {
-                        Spill();
+                        chunkBytes += EstimateBytes(rec);
+                    }
+                    if (rows.Count >= chunkSize || chunkBytes >= maxChunkBytes)
+                    {
+                        Spill(last: false);
                     }
                 }
-                if (buffer.Count > 0)
+
+                if (runs.Count == 0 && pending is null)
                 {
-                    Spill();
+                    // Everything fit in one chunk: sort it in memory and skip the disk entirely.
+                    var t = Stopwatch.GetTimestamp();
+                    inMemoryOrder = SortedOrder(keys, comparer);
+                    inMemoryRows = rows;
+                    inMemoryKeys = keys;
+                    sortMs = Stopwatch.GetElapsedTime(t).TotalMilliseconds;
+                    Log.SortedInMemory(logger, total, sortMs);
+                }
+                else
+                {
+                    if (rows.Count > 0)
+                    {
+                        Spill(last: true);
+                    }
+                    WaitPending();
                 }
 
-                Log.ChunkSortPhaseFinished(logger, ChunkSortPhase, runFiles.Count, total, bytesSpilled,
+                Log.ChunkSortPhaseFinished(logger, ChunkSortPhase, runs.Count, total, bytesSpilled,
                     Stopwatch.GetElapsedTime(phaseStart).TotalMilliseconds, sortMs, writeMs);
             }
             catch (Exception ex)
@@ -141,14 +234,19 @@ public static partial class ExternalSorter
                 throw;
             }
 
-            // -------- Phase 2: k-way merge --------
+            // -------- Phase 2: k-way merge (or the in-memory order) --------
             var mergeStart = Stopwatch.GetTimestamp();
             // Measuring the caller's time between records costs two timestamps per row, so only do it
             // when the Debug merge-phase line that reports it will be written.
             var timeConsumer = logger.IsEnabled(LogLevel.Debug);
             long consumerTicks = 0;
 
-            using (var merge = Merge(runFiles, keySelector, comparer, delimiter, quote).GetEnumerator())
+            var source = inMemoryOrder is not null
+                ? InMemory(inMemoryRows!, inMemoryOrder)
+                : Merge(runs, keySelector, comparer, options.MergeReadBufferSize);
+            inMemoryKeys = null; // keys are not needed while yielding
+
+            using (var merge = source.GetEnumerator())
             {
                 while (true)
                 {
@@ -185,13 +283,25 @@ public static partial class ExternalSorter
             completed = true;
             var mergeMs = Stopwatch.GetElapsedTime(mergeStart).TotalMilliseconds;
             var consumerMs = Stopwatch.GetElapsedTime(0, consumerTicks).TotalMilliseconds;
-            Log.MergePhaseFinished(logger, MergePhase, merged, runFiles.Count, mergeMs, mergeMs - consumerMs, consumerMs);
+            Log.MergePhaseFinished(logger, MergePhase, merged, runs.Count, mergeMs, mergeMs - consumerMs, consumerMs);
 
             var durationMs = Stopwatch.GetElapsedTime(sortStart).TotalMilliseconds;
-            Log.SortCompleted(logger, total, runFiles.Count, bytesSpilled, durationMs, RecordsPerSecond(total, durationMs));
+            Log.SortCompleted(logger, total, runs.Count, bytesSpilled, durationMs, RecordsPerSecond(total, durationMs));
         }
         finally
         {
+            if (pending is not null)
+            {
+                // Phase 1 failed while a chunk was still being written: let it finish before deleting its file.
+                try
+                {
+                    pending.Wait();
+                }
+                catch (Exception)
+                {
+                    // Already failing; the original exception is the one that matters.
+                }
+            }
             if (!completed && !failed)
             {
                 // The caller stopped enumerating (e.g. Take(n)) before the merge finished.
@@ -204,92 +314,253 @@ public static partial class ExternalSorter
     internal static double RecordsPerSecond(long rows, double durationMs)
         => durationMs > 0 ? Math.Round(rows / (durationMs / 1000.0), 1) : 0;
 
+    /// <summary>A rough managed-heap size of one record: the array plus each string.</summary>
+    private static long EstimateBytes(string[] record)
+    {
+        long bytes = 32 + 8L * record.Length;
+        foreach (var field in record)
+        {
+            bytes += 24 + 2L * (field?.Length ?? 0);
+        }
+        return bytes;
+    }
+
+    /// <summary>The stable sort order of <paramref name="keys"/>: ties keep their input order.</summary>
+    private static int[] SortedOrder<TKey>(List<TKey> keys, IComparer<TKey> comparer)
+    {
+        var order = new int[keys.Count];
+        for (var i = 0; i < order.Length; i++)
+        {
+            order[i] = i;
+        }
+        var keyArray = keys;
+        Array.Sort(order, (a, b) =>
+        {
+            var c = comparer.Compare(keyArray[a], keyArray[b]);
+            return c != 0 ? c : a.CompareTo(b);
+        });
+        return order;
+    }
+
+    private static IEnumerable<string[]> InMemory(List<string[]> rows, int[] order)
+    {
+        for (var i = 0; i < order.Length; i++)
+        {
+            yield return rows[order[i]];
+        }
+    }
+
     private static IEnumerable<string[]> Merge<TKey>(
-        List<string> runFiles,
+        List<SpilledRun> runs,
         Func<string[], TKey> keySelector,
         IComparer<TKey> comparer,
-        char delimiter,
-        char quote)
+        int readBufferSize)
     {
-        var readers = new List<TextReader>(runFiles.Count);
-        var cursors = new IEnumerator<string[]>[runFiles.Count];
+        var readers = new RunReader[runs.Count];
         try
         {
-            // Min-heap over run index, prioritized by the current record's key.
-            var heap = new PriorityQueue<int, TKey>(comparer);
-            for (var i = 0; i < runFiles.Count; i++)
+            // Min-heap over run index, prioritized by the current record's key, then by run index so that equal
+            // keys come out in input order (earlier runs hold earlier input).
+            var heap = new PriorityQueue<int, (TKey Key, int Run)>(new RunKeyComparer<TKey>(comparer));
+            for (var i = 0; i < runs.Count; i++)
             {
-                var reader = new StreamReader(runFiles[i], Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 1 << 20);
-                readers.Add(reader);
-                var cursor = CsvReader.ParseAll(reader, delimiter, quote).GetEnumerator();
-                cursors[i] = cursor;
-                if (cursor.MoveNext())
+                readers[i] = new RunReader(runs[i], readBufferSize);
+                if (readers[i].MoveNext())
                 {
-                    heap.Enqueue(i, keySelector(cursor.Current));
+                    heap.Enqueue(i, (keySelector(readers[i].Current), i));
                 }
             }
 
             while (heap.Count > 0)
             {
                 var i = heap.Dequeue();
-                yield return cursors[i].Current;
-                if (cursors[i].MoveNext())
+                var reader = readers[i];
+                yield return reader.Current;
+                if (reader.MoveNext())
                 {
-                    heap.Enqueue(i, keySelector(cursors[i].Current));
+                    heap.Enqueue(i, (keySelector(reader.Current), i));
                 }
             }
         }
         finally
         {
-            foreach (var cursor in cursors)
-            {
-                cursor?.Dispose();
-            }
             foreach (var reader in readers)
             {
-                reader.Dispose();
+                reader?.Dispose();
             }
         }
     }
 
-    private readonly record struct SpilledRun(string Path, long Bytes, double SortMs, double WriteMs);
+    private sealed class RunKeyComparer<TKey>(IComparer<TKey> inner) : IComparer<(TKey Key, int Run)>
+    {
+        public int Compare((TKey Key, int Run) x, (TKey Key, int Run) y)
+        {
+            var c = inner.Compare(x.Key, y.Key);
+            return c != 0 ? c : x.Run.CompareTo(y.Run);
+        }
+    }
+
+    /// <summary>Reads one binary run file: per record, a 7-bit field count then each field as a
+    /// length-prefixed UTF-8 string (the <see cref="BinaryWriter"/> string format).</summary>
+    private sealed class RunReader : IDisposable
+    {
+        private readonly BinaryReader _reader;
+        private long _remaining;
+
+        public RunReader(SpilledRun run, int bufferSize)
+        {
+            var stream = new FileStream(run.Path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, FileOptions.SequentialScan);
+            _reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
+            _remaining = run.Rows;
+        }
+
+        public string[] Current { get; private set; } = Array.Empty<string>();
+
+        public bool MoveNext()
+        {
+            if (_remaining <= 0)
+            {
+                return false;
+            }
+            _remaining--;
+            var count = _reader.Read7BitEncodedInt();
+            var record = new string[count];
+            for (var i = 0; i < count; i++)
+            {
+                record[i] = _reader.ReadString();
+            }
+            Current = record;
+            return true;
+        }
+
+        public void Dispose() => _reader.Dispose();
+    }
+
+    private readonly record struct SpilledRun(string Path, long Rows, long Bytes, double SortMs, double WriteMs);
 
     private static SpilledRun WriteSortedRun<TKey>(
-        List<string[]> buffer,
-        Func<string[], TKey> keySelector,
+        List<string[]> rows,
+        List<TKey> keys,
         IComparer<TKey> comparer,
         string workDir,
         int index,
-        char delimiter,
-        char quote,
         ILogger logger)
     {
         var sortStart = Stopwatch.GetTimestamp();
-        buffer.Sort((a, b) => comparer.Compare(keySelector(a), keySelector(b)));
+        var order = SortedOrder(keys, comparer);
         var writeStart = Stopwatch.GetTimestamp();
 
-        var path = Path.Combine(workDir, $"run_{index:D6}.csv");
+        var path = Path.Combine(workDir, $"run_{index:D6}.bin");
         long bytes;
-        using (var writer = new StreamWriter(path, append: false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), bufferSize: 1 << 20)
+        using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, bufferSize: 1 << 18))
+        using (var writer = new BinaryWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), leaveOpen: true))
         {
-            NewLine = "\n",
-        })
-        {
-            var sb = new StringBuilder();
-            foreach (var rec in buffer)
+            foreach (var i in order)
             {
-                sb.Clear();
-                CsvWriter.AppendRecord(sb, rec, delimiter, quote);
-                writer.WriteLine(sb.ToString());
+                var rec = rows[i];
+                writer.Write7BitEncodedInt(rec.Length);
+                foreach (var field in rec)
+                {
+                    writer.Write(field ?? string.Empty);
+                }
             }
             writer.Flush();
-            bytes = writer.BaseStream.Position;
+            bytes = stream.Position;
         }
 
         var sortMs = Stopwatch.GetElapsedTime(sortStart, writeStart).TotalMilliseconds;
         var writeMs = Stopwatch.GetElapsedTime(writeStart).TotalMilliseconds;
-        Log.ChunkSpilled(logger, index, buffer.Count, bytes, sortMs + writeMs, sortMs, writeMs);
-        return new SpilledRun(path, bytes, sortMs, writeMs);
+        Log.ChunkSpilled(logger, index, rows.Count, bytes, sortMs + writeMs, sortMs, writeMs);
+        return new SpilledRun(path, rows.Count, bytes, sortMs, writeMs);
+    }
+
+    private const string WorkDirectoryPrefix = "extsort_";
+    private const string OwnerFileName = "owner.pid";
+
+    private static void WriteOwnerFile(string workDir)
+    {
+        try
+        {
+            File.WriteAllText(Path.Combine(workDir, OwnerFileName), Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+        catch (IOException)
+        {
+            // Only used by CleanupStaleWorkDirectories; the sort itself does not need it.
+        }
+    }
+
+    /// <summary>
+    /// Deletes <c>extsort_*</c> working directories left behind in <paramref name="tempDirectory"/> (default: the
+    /// system temp folder) by sorts whose process was killed before it could clean up. A directory is removed
+    /// when the process recorded in it is no longer running, or, for directories from versions before 2.1 that
+    /// record no owner, when it has not been modified for <paramref name="unownedMinimumAge"/> (default 24 hours).
+    /// Returns the number of directories deleted.
+    /// </summary>
+    public static int CleanupStaleWorkDirectories(string? tempDirectory = null, TimeSpan? unownedMinimumAge = null, ILogger? logger = null)
+    {
+        logger ??= NullLogger.Instance;
+        var root = tempDirectory ?? Path.GetTempPath();
+        if (!Directory.Exists(root))
+        {
+            return 0;
+        }
+        var minimumAge = unownedMinimumAge ?? TimeSpan.FromHours(24);
+        var deleted = 0;
+        long bytes = 0;
+        foreach (var dir in Directory.EnumerateDirectories(root, WorkDirectoryPrefix + "*"))
+        {
+            try
+            {
+                if (!IsStale(dir, minimumAge))
+                {
+                    continue;
+                }
+                long size = 0;
+                foreach (var file in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+                {
+                    size += new FileInfo(file).Length;
+                }
+                Directory.Delete(dir, recursive: true);
+                deleted++;
+                bytes += size;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Log.CleanupFailed(logger, ex, dir);
+            }
+        }
+        if (deleted > 0)
+        {
+            Log.StaleDirectoriesDeleted(logger, deleted, bytes, root);
+        }
+        return deleted;
+    }
+
+    private static bool IsStale(string dir, TimeSpan unownedMinimumAge)
+    {
+        var ownerFile = Path.Combine(dir, OwnerFileName);
+        if (File.Exists(ownerFile)
+            && int.TryParse(File.ReadAllText(ownerFile).Trim(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var pid))
+        {
+            if (pid == Environment.ProcessId)
+            {
+                return false;
+            }
+            try
+            {
+                using var process = Process.GetProcessById(pid);
+                return process.HasExited;
+            }
+            catch (ArgumentException)
+            {
+                return true; // no such process
+            }
+            catch (InvalidOperationException)
+            {
+                return true;
+            }
+        }
+        return DateTime.UtcNow - Directory.GetLastWriteTimeUtc(dir) >= unownedMinimumAge;
     }
 
     private static void TryDeleteDirectory(string dir, ILogger logger)
@@ -346,5 +617,13 @@ public static partial class ExternalSorter
         [LoggerMessage(EventId = 1308, Level = LogLevel.Warning,
             Message = "External sort could not delete temp directory {FilePath}")]
         public static partial void CleanupFailed(ILogger logger, Exception exception, string filePath);
+
+        [LoggerMessage(EventId = 1309, Level = LogLevel.Debug,
+            Message = "External sort fit in one chunk: {RowCount} rows sorted in memory, nothing spilled, {DurationMs} ms")]
+        public static partial void SortedInMemory(ILogger logger, long rowCount, double durationMs);
+
+        [LoggerMessage(EventId = 1310, Level = LogLevel.Information,
+            Message = "Deleted {DirectoryCount} stale external sort directories ({ByteCount} bytes) from {FilePath}")]
+        public static partial void StaleDirectoriesDeleted(ILogger logger, int directoryCount, long byteCount, string filePath);
     }
 }
